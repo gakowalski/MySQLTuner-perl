@@ -22,6 +22,6 @@ like($help_output, qr/--colstat \(--no-colstat\)/, "Help should show negation al
 like($help_output, qr/--pfstat \(--no-pfstat\)/, "Help should show negation aliases for pfstat");
 
 # 4. Check for absolute path leak (best practice 12)
-unlike($help_output, qr/home\/jmren/, "Help should not contain absolute workstation paths");
+unlike($help_output, qr/(?:home|Users)[\\\/]jmren/i, "Help should not contain absolute workstation paths");
 
 done_testing();

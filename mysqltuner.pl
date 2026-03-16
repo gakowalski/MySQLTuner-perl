@@ -55,6 +55,13 @@ use Cwd 'abs_path';
 sub show_help;
 sub subheaderprint;
 sub execute_system_command;
+sub shell_quote_arg;
+sub quote_command_path;
+sub join_command_parts;
+sub mysql_password_option;
+sub mysql_alive_query;
+sub build_mysql_alive_check_command;
+sub find_nearby_log_files;
 
 #use Data::Dumper;
 #$Data::Dumper::Pair = " : ";
@@ -63,6 +70,7 @@ sub execute_system_command;
 #use Env;
 
 our $is_win = $^O eq 'MSWin32';
+our $windows_os_name;
 
 # Set up a few variables for use in the script
 our $tunerversion = "2.8.38";
@@ -177,13 +185,6 @@ our %CLI_METADATA = (
         default     => '0',
         desc        => 'Force TCP connection instead of socket',
         placeholder => 'tcp',
-        cat         => 'CONNECTION'
-    },
-    'server-log' => {
-        type        => '=s',
-        default     => '0',
-        desc        => 'Path to explicit log file (error_log)',
-        placeholder => '<path>',
         cat         => 'CONNECTION'
     },
 
@@ -701,7 +702,11 @@ sub setup_environment {
     $opt{nocolor} = 0 if ( ( $opt{color} // 0 ) == 1 );
 
     # Setting up the colors for the print styles
-    $me = ( getpwuid($<) )[0] // $ENV{USER} // $ENV{USERNAME} // 'unknown';
+    my $login_name;
+    if ( !$is_win ) {
+        $login_name = eval { scalar getpwuid($<) };
+    }
+    $me = $login_name // $ENV{USER} // $ENV{USERNAME} // 'unknown';
 
     if ($is_win) { $opt{nocolor} = 1; }
     $good = ( $opt{nocolor} == 0 ) ? "[\e[0;32mOK\e[0m]"  : "[OK]";
@@ -718,6 +723,11 @@ sub setup_environment {
         $deb  = ( $opt{nocolor} == 0 ) ? "\e[0;31m⚙\e[0m " : "⚙ ";
         $cmd  = ( $opt{nocolor} == 0 ) ? "\e[1;32m⌨️($me)" : "⌨️($me)";
         $end  = ( $opt{nocolor} == 0 ) ? "\e[0m  "         : "  ";
+    }
+
+    if ($is_win) {
+        my $os_name = $windows_os_name || 'Windows';
+        infoprint("* Windows OS ($os_name) is not fully tested.");
     }
 
     # Maximum lines of log output to read from end
@@ -810,19 +820,23 @@ sub prettyprint {
 }
 
 sub goodprint {
-    prettyprint $good. " " . $_[0] unless ( $opt{nogood} == 1 );
+    my $prefix = defined $good ? $good : '[OK]';
+    prettyprint $prefix . " " . $_[0] unless ( $opt{nogood} == 1 );
 }
 
 sub infoprint {
-    prettyprint $info. " " . $_[0] unless ( $opt{noinfo} == 1 );
+    my $prefix = defined $info ? $info : '[--]';
+    prettyprint $prefix . " " . $_[0] unless ( $opt{noinfo} == 1 );
 }
 
 sub badprint {
-    prettyprint $bad. " " . $_[0] unless ( $opt{nobad} == 1 );
+    my $prefix = defined $bad ? $bad : '[!!]';
+    prettyprint $prefix . " " . $_[0] unless ( $opt{nobad} == 1 );
 }
 
 sub debugprint {
-    prettyprint $deb. " " . $_[0] unless ( $opt{debug} == 0 );
+    my $prefix = defined $deb ? $deb : '[DG]';
+    prettyprint $prefix . " " . $_[0] unless ( $opt{debug} == 0 );
 }
 
 sub redwrap {
@@ -948,12 +962,12 @@ sub cpu_cores {
         return $cntCPU + 0;
     }
     if ($is_win) {
-        my $cntCPU =
-          execute_system_command(
-'wmic cpu get NumberOfCores| perl -ne "s/[^0-9]//g; print if /[0-9]+/;"'
-          );
-        chomp $cntCPU;
-        return $cntCPU + 0;
+                my $values =
+                    parse_key_value_output(
+                        execute_system_command('wmic cpu get NumberOfCores /value') );
+                my $cntCPU = extract_numeric_value( $values->{NumberOfCores} );
+                return $cntCPU + 0 if defined $cntCPU;
+                return ( $ENV{NUMBER_OF_PROCESSORS} || 0 ) + 0;
     }
     return 0;
 }
@@ -986,12 +1000,13 @@ sub logical_cpu_cores {
         return $cntCPU + 0;
     }
     if ($is_win) {
-        my $cntCPU =
-          execute_system_command(
-'wmic cpu get NumberOfLogicalProcessors| perl -ne "s/[^0-9]//g; print if /[0-9]+/;"'
-          );
-        chomp $cntCPU;
-        return $cntCPU + 0;
+                my $values = parse_key_value_output(
+                        execute_system_command('wmic cpu get NumberOfLogicalProcessors /value')
+                );
+                my $cntCPU =
+                    extract_numeric_value( $values->{NumberOfLogicalProcessors} );
+                return $cntCPU + 0 if defined $cntCPU;
+                return ( $ENV{NUMBER_OF_PROCESSORS} || 0 ) + 0;
     }
     return cpu_cores();
 }
@@ -1130,131 +1145,124 @@ sub memerror {
 }
 
 sub os_setup {
-    my $prefix = get_transport_prefix();
-    my $os;
-    if ($is_win) {
-        $os = 'windows';
-    }
-    elsif ( $prefix eq '' ) {
-        $os = ( POSIX::uname() )[0];
-    }
-    else {
-        $os = execute_system_command('uname');
-    }
-
-    $duflags    = ( $os =~ /Linux/ )        ? '-b' : '';
-    $xargsflags = ( $os =~ /Darwin|SunOS/ ) ? ''   : '-r';
-    if ( $opt{'forcemem'} > 0 ) {
-        $physical_memory = $opt{'forcemem'} * 1048576;
-        infoprint "Assuming $opt{'forcemem'} MB of physical memory";
-        if ( $opt{'forceswap'} > 0 ) {
-            $swap_memory = $opt{'forceswap'} * 1048576;
-            infoprint "Assuming $opt{'forceswap'} MB of swap space";
+        my $prefix = get_transport_prefix();
+        my $os;
+        if ($is_win) {
+                $os = 'windows';
+        }
+        elsif ( $prefix eq '' ) {
+                $os = ( POSIX::uname() )[0];
         }
         else {
-            $swap_memory = 0;
-            badprint "Assuming 0 MB of swap space (use --forceswap to specify)";
+                $os = execute_system_command('uname');
         }
-    }
-    else {
-        if ( $os =~ /Linux|CYGWIN/ ) {
-            if ( $prefix eq '' && open( my $meminfo, '<', '/proc/meminfo' ) ) {
-                while (<$meminfo>) {
-                    if (/^MemTotal:\s+(\d+)/i) { $physical_memory = $1 * 1024; }
-                    if (/^SwapTotal:\s+(\d+)/i) { $swap_memory = $1 * 1024; }
+
+        $duflags    = ( $os =~ /Linux/ )        ? '-b' : '';
+        $xargsflags = ( $os =~ /Darwin|SunOS/ ) ? ''   : '-r';
+        if ( $opt{'forcemem'} > 0 ) {
+                $physical_memory = $opt{'forcemem'} * 1048576;
+                infoprint "Assuming $opt{'forcemem'} MB of physical memory";
+                if ( $opt{'forceswap'} > 0 ) {
+                        $swap_memory = $opt{'forceswap'} * 1048576;
+                        infoprint "Assuming $opt{'forceswap'} MB of swap space";
                 }
-                close $meminfo;
-            }
+                else {
+                        $swap_memory = 0;
+                        badprint "Assuming 0 MB of swap space (use --forceswap to specify)";
+                }
+        }
+        else {
+                if ( $os =~ /Linux|CYGWIN/ ) {
+                        if ( $prefix eq '' && open( my $meminfo, '<', '/proc/meminfo' ) ) {
+                                while (<$meminfo>) {
+                                        if (/^MemTotal:\s+(\d+)/i) { $physical_memory = $1 * 1024; }
+                                        if (/^SwapTotal:\s+(\d+)/i) { $swap_memory = $1 * 1024; }
+                                }
+                                close $meminfo;
+                        }
 
-            if ( !defined $physical_memory || $physical_memory == 0 ) {
-                $physical_memory =
-                  execute_system_command(
-                    "grep -i memtotal: /proc/meminfo | awk '{print \$2}'")
-                  or memerror;
-                $physical_memory *= 1024;
-            }
+                        if ( !defined $physical_memory || $physical_memory == 0 ) {
+                                $physical_memory =
+                                    execute_system_command(
+                                        "grep -i memtotal: /proc/meminfo | awk '{print \$2}'")
+                                    or memerror;
+                                $physical_memory *= 1024;
+                        }
 
-            if ( !defined $swap_memory ) {
-                $swap_memory =
-                  execute_system_command(
-                    "grep -i swaptotal: /proc/meminfo | awk '{print \$2}'")
-                  or memerror;
-                $swap_memory *= 1024;
-            }
+                        if ( !defined $swap_memory ) {
+                                $swap_memory =
+                                    execute_system_command(
+                                        "grep -i swaptotal: /proc/meminfo | awk '{print \$2}'")
+                                    or memerror;
+                                $swap_memory *= 1024;
+                        }
+                }
+                elsif ( $os =~ /Darwin/ ) {
+                        $physical_memory = execute_system_command('sysctl -n hw.memsize')
+                            or memerror;
+                        $swap_memory =
+                            execute_system_command(
+                                "sysctl -n vm.swapusage | awk '{print \$3}' | sed 's/\..*\$//'")
+                            or memerror;
+                }
+                elsif ( $os =~ /NetBSD|OpenBSD|FreeBSD/ ) {
+                        $physical_memory = execute_system_command('sysctl -n hw.physmem')
+                            or memerror;
+                        if ( $physical_memory < 0 ) {
+                                $physical_memory =
+                                         execute_system_command('sysctl -n hw.physmem64')
+                                    or memerror;
+                        }
+                        $swap_memory =
+                            execute_system_command(
+                                "swapctl -l | grep '^/' | awk '{ s+= \$2 } END { print s }'")
+                            or memerror;
+                }
+                elsif ( $os =~ /BSD/ ) {
+                        $physical_memory = execute_system_command('sysctl -n hw.realmem')
+                            or memerror;
+                        $swap_memory =
+                            execute_system_command(
+                                "swapinfo | grep '^/' | awk '{ s+= \$2 } END { print s }'");
+                }
+                elsif ( $os =~ /SunOS/ ) {
+                        $physical_memory =
+                            execute_system_command(
+                                "/usr/sbin/prtconf | grep Memory | cut -f 3 -d ' '")
+                            or memerror;
+                        chomp($physical_memory);
+                        $physical_memory = $physical_memory * 1024 * 1024;
+                }
+                elsif ( $os =~ /AIX/ ) {
+                        $physical_memory =
+                            execute_system_command(
+                                "lsattr -El sys0 | grep realmem | awk '{print \$2}'")
+                            or memerror;
+                        chomp($physical_memory);
+                        $physical_memory = $physical_memory * 1024;
+                        $swap_memory     = execute_system_command(
+                                "lsps -as | awk -F'(MB| +)' '/MB /{print \$2}'")
+                            or memerror;
+                        chomp($swap_memory);
+                        $swap_memory = $swap_memory * 1024 * 1024;
+                }
+                elsif ( $os =~ /windows/i ) {
+                        my $stats = get_windows_memory_stats();
+                        $physical_memory = $stats->{physical_memory} || memerror;
+                        $swap_memory     = $stats->{swap_memory};
+                }
         }
-        elsif ( $os =~ /Darwin/ ) {
-            $physical_memory = execute_system_command('sysctl -n hw.memsize')
-              or memerror;
-            $swap_memory =
-              execute_system_command(
-                "sysctl -n vm.swapusage | awk '{print \$3}' | sed 's/\..*\$//'")
-              or memerror;
-        }
-        elsif ( $os =~ /NetBSD|OpenBSD|FreeBSD/ ) {
-            $physical_memory = execute_system_command('sysctl -n hw.physmem')
-              or memerror;
-            if ( $physical_memory < 0 ) {
-                $physical_memory =
-                     execute_system_command('sysctl -n hw.physmem64')
-                  or memerror;
-            }
-            $swap_memory =
-              execute_system_command(
-                "swapctl -l | grep '^/' | awk '{ s+= \$2 } END { print s }'")
-              or memerror;
-        }
-        elsif ( $os =~ /BSD/ ) {
-            $physical_memory = execute_system_command('sysctl -n hw.realmem')
-              or memerror;
-            $swap_memory =
-              execute_system_command(
-                "swapinfo | grep '^/' | awk '{ s+= \$2 } END { print s }'");
-        }
-        elsif ( $os =~ /SunOS/ ) {
-            $physical_memory =
-              execute_system_command(
-                "/usr/sbin/prtconf | grep Memory | cut -f 3 -d ' '")
-              or memerror;
-            chomp($physical_memory);
-            $physical_memory = $physical_memory * 1024 * 1024;
-        }
-        elsif ( $os =~ /AIX/ ) {
-            $physical_memory =
-              execute_system_command(
-                "lsattr -El sys0 | grep realmem | awk '{print \$2}'")
-              or memerror;
-            chomp($physical_memory);
-            $physical_memory = $physical_memory * 1024;
-            $swap_memory     = execute_system_command(
-                "lsps -as | awk -F'(MB| +)' '/MB /{print \$2}'")
-              or memerror;
-            chomp($swap_memory);
-            $swap_memory = $swap_memory * 1024 * 1024;
-        }
-        elsif ( $os =~ /windows/i ) {
-            $physical_memory =
-              execute_system_command(
-'wmic ComputerSystem get TotalPhysicalMemory | perl -ne "s/[^0-9]//g; print if /[0-9]+/;'
-              ) or memerror;
-            $swap_memory =
-              execute_system_command(
-'wmic OS get FreeVirtualMemory | perl -ne "s/[^0-9]//g; print if /[0-9]+/;'
-              ) or memerror;
-        }
-    }
-    debugprint "Physical Memory: $physical_memory";
-    debugprint "Swap Memory: $swap_memory";
-    chomp($physical_memory);
-    chomp($swap_memory);
-    chomp($os);
-    $result{'OS'}{'OS Type'}                   = $os;
-    $result{'OS'}{'Physical Memory'}{'bytes'}  = $physical_memory;
-    $result{'OS'}{'Physical Memory'}{'pretty'} = hr_bytes($physical_memory);
-    $result{'OS'}{'Swap Memory'}{'bytes'}      = $swap_memory;
-    $result{'OS'}{'Swap Memory'}{'pretty'}     = hr_bytes($swap_memory);
-    $result{'OS'}{'Other Processes'}{'bytes'}  = get_other_process_memory();
-    $result{'OS'}{'Other Processes'}{'pretty'} =
-      hr_bytes( get_other_process_memory() );
+        debugprint "Physical Memory: $physical_memory";
+        chomp($physical_memory);
+        debugprint "Swap Memory: $swap_memory";
+        chomp($swap_memory);
+        $result{'OS'}{'Physical Memory'}{'bytes'}  = $physical_memory;
+        $result{'OS'}{'Physical Memory'}{'pretty'} = hr_bytes($physical_memory);
+        $result{'OS'}{'Swap Memory'}{'bytes'}      = $swap_memory;
+        $result{'OS'}{'Swap Memory'}{'pretty'}     = hr_bytes($swap_memory);
+        $result{'OS'}{'Other Processes'}{'bytes'}  = get_other_process_memory();
+        $result{'OS'}{'Other Processes'}{'pretty'} =
+            hr_bytes( get_other_process_memory() );
 }
 
 sub get_http_cli {
@@ -1489,11 +1497,12 @@ sub get_ssh_prefix {
     return "" if not( $opt{'cloud'} and $opt{'ssh-host'} );
 
     my $ssh_base_cmd = 'ssh';
+        my $known_hosts_null = File::Spec->devnull();
     if ( $opt{'ssh-identity-file'} ) {
         $ssh_base_cmd .= " -i '" . $opt{'ssh-identity-file'} . "'";
     }
     $ssh_base_cmd .=
-      " -o 'StrictHostKeyChecking=no' -o 'UserKnownHostsFile=/dev/null'";
+            " -o 'StrictHostKeyChecking=no' -o 'UserKnownHostsFile=$known_hosts_null'";
     my $ssh_target = '';
     if ( $opt{'ssh-user'} ) {
         $ssh_target = $opt{'ssh-user'} . '@';
@@ -1561,7 +1570,11 @@ sub execute_system_command {
     }
 
     debugprint "Executing system command: $full_cmd";
-    my @output = `$full_cmd 2>&1`;
+        my $has_stderr_redirection =
+            $full_cmd =~ /(?:^|\s)2(?:>>?|>&1)(?:\s*\S+)?(?:\s|$)/;
+        my $command_to_run =
+            $has_stderr_redirection ? $full_cmd : "$full_cmd 2>&1";
+        my @output = `$command_to_run`;
 
     if ( $? != 0 ) {
 
@@ -1579,12 +1592,264 @@ sub execute_system_command {
     return wantarray ? @output : join( "", @output );
 }
 
-if ($is_win) {
-    eval { require Win32; } or last;
-    my $osname = Win32::GetOSName();
-    infoprint "* Windows OS ($osname) is not fully tested.\n";
+sub shell_quote_arg {
+    my ($arg) = @_;
+    $arg = '' unless defined $arg;
 
-    #exit 1;
+    if ($is_win) {
+        $arg =~ s/"/\\"/g;
+        return qq("$arg");
+    }
+
+    $arg =~ s/'/'\\''/g;
+    return "'$arg'";
+}
+
+sub quote_command_path {
+    my ($command) = @_;
+    return '' unless defined $command;
+    return $command if $command =~ /^".*"$/ || $command =~ /^'.*'$/;
+    return $command unless $command =~ /\s/;
+    return shell_quote_arg($command);
+}
+
+sub join_command_parts {
+    return join ' ', grep { defined $_ && length $_ } @_;
+}
+
+sub mysql_password_option {
+    my ($password) = @_;
+    return '' unless defined $password && length $password;
+    return '-p' . shell_quote_arg($password);
+}
+
+sub mysql_alive_query {
+    return shell_quote_arg(q{select 'mysqld is alive';});
+}
+
+sub build_mysql_alive_check_command {
+    my ( $client_cmd, $login_args, @extra_args ) = @_;
+    return join_command_parts( $client_cmd, $login_args, '-Nrs', '-e',
+        mysql_alive_query(), @extra_args );
+}
+
+sub parse_key_value_output {
+    my @lines = @_;
+    my %values;
+
+    for my $line (@lines) {
+        next unless defined $line;
+        $line =~ s/\r?\n$//;
+        next unless $line =~ /^\s*([^=:\r\n]+?)\s*=\s*(.*?)\s*$/;
+        $values{$1} = $2;
+    }
+
+    return \%values;
+}
+
+sub parse_wmic_record_list {
+    my @lines = @_;
+    my @records;
+    my %current;
+
+    for my $line (@lines) {
+        next unless defined $line;
+        $line =~ s/\r?\n$//;
+
+        if ( $line =~ /^\s*$/ ) {
+            if (%current) {
+                push @records, { %current };
+                %current = ();
+            }
+            next;
+        }
+
+        next unless $line =~ /^\s*([^=:\r\n]+?)\s*=\s*(.*?)\s*$/;
+        $current{$1} = $2;
+    }
+
+    push @records, { %current } if %current;
+    return @records;
+}
+
+sub extract_numeric_value {
+    my ($value) = @_;
+    return undef unless defined $value;
+    $value =~ s/[^0-9]//g;
+    return length($value) ? $value + 0 : undef;
+}
+
+sub format_wmic_datetime {
+    my ($value) = @_;
+    return 'Unavailable' unless defined $value;
+    return "$1-$2-$3 $4:$5:$6"
+      if $value =~ /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/;
+    return $value;
+}
+
+sub get_windows_memory_stats {
+    my %stats = (
+        physical_memory         => 0,
+        swap_memory             => 0,
+        total_visible_memory_kb => 0,
+        free_physical_memory_kb => 0,
+        total_virtual_memory_kb => 0,
+    );
+
+    my $os_values = parse_key_value_output(
+        execute_system_command(
+            'wmic OS get TotalVisibleMemorySize,FreePhysicalMemory,TotalVirtualMemorySize /value'
+        )
+    );
+    my $cs_values = parse_key_value_output(
+        execute_system_command('wmic ComputerSystem get TotalPhysicalMemory /value')
+    );
+
+    $stats{total_visible_memory_kb} =
+      extract_numeric_value( $os_values->{TotalVisibleMemorySize} ) || 0;
+    $stats{free_physical_memory_kb} =
+      extract_numeric_value( $os_values->{FreePhysicalMemory} ) || 0;
+    $stats{total_virtual_memory_kb} =
+      extract_numeric_value( $os_values->{TotalVirtualMemorySize} ) || 0;
+    $stats{physical_memory} =
+         extract_numeric_value( $cs_values->{TotalPhysicalMemory} )
+      || $stats{total_visible_memory_kb} * 1024;
+
+    if (   $stats{total_virtual_memory_kb}
+        && $stats{total_visible_memory_kb}
+        && $stats{total_virtual_memory_kb} >= $stats{total_visible_memory_kb} )
+    {
+        $stats{swap_memory} =
+          ( $stats{total_virtual_memory_kb} - $stats{total_visible_memory_kb} )
+          * 1024;
+    }
+
+    return \%stats;
+}
+
+sub get_windows_free_memory_report {
+    my $stats = get_windows_memory_stats();
+    my $total_mb = int( ( $stats->{total_visible_memory_kb} || 0 ) / 1024 );
+    my $free_mb  = int( ( $stats->{free_physical_memory_kb} || 0 ) / 1024 );
+    my $used_mb  = $total_mb - $free_mb;
+    $used_mb = 0 if $used_mb < 0;
+    return "Memory(MB): total=$total_mb used=$used_mb free=$free_mb";
+}
+
+sub parse_windows_ipv4_from_ipconfig {
+    my @lines = @_;
+    for my $line (@lines) {
+        next unless defined $line;
+        if ( $line =~ /IPv4[^:]*:\s*([0-9]+(?:\.[0-9]+){3})/i ) {
+            next if $1 =~ /^169\.254\./;
+            return $1;
+        }
+    }
+    return '';
+}
+
+sub parse_windows_nameservers_from_ipconfig {
+    my @lines = @_;
+    my @servers;
+    my $collect_more = 0;
+
+    for my $line (@lines) {
+        next unless defined $line;
+        $line =~ s/\r?\n$//;
+
+        if ( $line =~ /^\s*DNS Servers[^:]*:\s*(\S.*)$/i ) {
+            push @servers, $1 if $1 ne '';
+            $collect_more = 1;
+            next;
+        }
+
+        if ($collect_more) {
+            if ( $line =~ /^\s+([0-9a-fA-F:.]+)\s*$/ ) {
+                push @servers, $1;
+                next;
+            }
+            $collect_more = 0;
+        }
+    }
+
+    my %seen;
+    @servers = grep { defined $_ && $_ ne '' && !$seen{$_}++ } @servers;
+    return join( ', ', @servers );
+}
+
+sub get_windows_last_boot_time {
+    my $values =
+      parse_key_value_output(
+        execute_system_command('wmic OS get LastBootUpTime /value') );
+    return format_wmic_datetime( $values->{LastBootUpTime} );
+}
+
+sub get_windows_logged_users {
+    my @users;
+
+    if ( my $query_cmd = which( 'query', $ENV{'PATH'} ) ) {
+        @users = execute_system_command("$query_cmd user");
+    }
+
+    if ( !@users ) {
+        my $whoami = execute_system_command('whoami');
+        @users = ($whoami) if defined $whoami && $whoami ne '';
+    }
+
+    return wantarray ? @users : join( '', @users );
+}
+
+sub mysql_client_option_files {
+    my ($userpath) = @_;
+    my @candidates;
+    my %seen;
+
+    if ( defined $userpath && length $userpath ) {
+        push @candidates,
+          File::Spec->catfile( $userpath, '.my.cnf' ),
+          File::Spec->catfile( $userpath, '.mylogin.cnf' );
+    }
+
+    if ($is_win) {
+        for my $base ( grep { defined && length } $ENV{APPDATA}, $ENV{USERPROFILE} ) {
+            push @candidates,
+              File::Spec->catfile( $base, 'MySQL', '.my.cnf' ),
+              File::Spec->catfile( $base, 'MySQL', '.mylogin.cnf' );
+        }
+    }
+
+    return grep { !$seen{$_}++ } @candidates;
+}
+
+sub has_mysql_client_option_file {
+    my ($userpath) = @_;
+    return scalar grep { -e $_ } mysql_client_option_files($userpath);
+}
+
+sub is_command_path_usable {
+    my ($path) = @_;
+    return 0 unless defined $path && length $path;
+    return -x $path unless $is_win;
+    return -f $path;
+}
+
+sub is_command_available {
+    my ($command) = @_;
+    return 0 unless defined $command && length $command;
+
+    if ( $command =~ m{[\\/]} || ( $is_win && $command =~ /^[A-Za-z]:/ ) ) {
+        return is_command_path_usable($command);
+    }
+
+    return defined which( $command, $ENV{'PATH'} );
+}
+
+if ($is_win) {
+    eval {
+        require Win32;
+        $windows_os_name = Win32::GetOSName();
+        1;
+    };
 }
 
 sub mysql_setup {
@@ -1607,14 +1872,15 @@ sub mysql_setup {
                   || which( "mysqladmin", $ENV{'PATH'} ) );
         }
     }
-    chomp($mysqladmincmd);
+    chomp($mysqladmincmd) if defined $mysqladmincmd;
     if ( !$mysqladmincmd
-        || ( $transport_prefix eq '' && !-x $mysqladmincmd ) )
+        || ( $transport_prefix eq '' && !is_command_available($mysqladmincmd) ) )
     {
         badprint
           "Couldn't find an executable mysqladmin/mariadb-admin command.";
         exit 1;
     }
+    $mysqladmincmd = quote_command_path($mysqladmincmd);
 
     if ( $opt{mysqlcmd} ) {
         $mysqlcmd = $opt{mysqlcmd};
@@ -1630,11 +1896,12 @@ sub mysql_setup {
                   || which( "mysql", $ENV{'PATH'} ) );
         }
     }
-    chomp($mysqlcmd);
-    if ( !$mysqlcmd || ( $transport_prefix eq '' && !-x $mysqlcmd ) ) {
+    chomp($mysqlcmd) if defined $mysqlcmd;
+    if ( !$mysqlcmd || ( $transport_prefix eq '' && !is_command_available($mysqlcmd) ) ) {
         badprint "Couldn't find an executable mysql/mariadb command.";
         exit 1;
     }
+    $mysqlcmd = quote_command_path($mysqlcmd);
 
     # Gather defaults file options
     my $defaults_options = '';
@@ -1652,8 +1919,8 @@ sub mysql_setup {
 
     # MySQL Client defaults
     $mysqlcmd =~ s/\n$//g;
-    my $mysqlclidefaults =
-      execute_system_command("$mysqlcmd $defaults_options --print-defaults");
+    my $mysqlclidefaults = execute_system_command(
+        join_command_parts( $mysqlcmd, $defaults_options, '--print-defaults' ) );
     debugprint "MySQL Client: $mysqlclidefaults";
     if ( $mysqlclidefaults =~ /auto-vertical-output/ ) {
         badprint
@@ -1747,11 +2014,10 @@ sub mysql_setup {
         my $username = $opt{user} ne 0 ? $opt{user} : "root";
         $mysqllogin =
             "$defaults_options -u $username "
-          . ( ( $opt{pass} ne 0 ) ? "-p'$opt{pass}' " : " " )
+                    . ( ( $opt{pass} ne 0 ) ? mysql_password_option( $opt{pass} ) . ' ' : ' ' )
           . $remotestring;
-        my $loginstatus =
-          execute_system_command(
-            "$mysqlcmd $mysqllogin -Nrs -e 'select \"mysqld is alive\";'");
+                my $loginstatus = execute_system_command(
+                        build_mysql_alive_check_command( $mysqlcmd, $mysqllogin ) );
         if ( $loginstatus =~ /mysqld is alive/ ) {
             goodprint "Logged in using credentials passed on the command line";
             return 1;
@@ -1759,7 +2025,7 @@ sub mysql_setup {
     }
 
     my $svcprop = which( "svcprop", $ENV{'PATH'} );
-    if ( substr( $svcprop, 0, 1 ) =~ "/" ) {
+        if ( defined $svcprop && substr( $svcprop, 0, 1 ) =~ "/" ) {
 
         # We are on solaris
         (
@@ -1879,10 +2145,11 @@ sub mysql_setup {
         #  $loginstatus=`$mysqladmincmd $remotestring ping 2>&1`;
         #} else {
         infoprint "Using mysql to check login";
-        my $loginstatus =
-          execute_system_command(
-"$mysqlcmd $defaults_options $remotestring -Nrs -e 'select \"mysqld is alive\"' --connect-timeout=3"
-          );
+                my $loginstatus = execute_system_command(
+                        build_mysql_alive_check_command( $mysqlcmd,
+                                join_command_parts( $defaults_options, $remotestring ),
+                                '--connect-timeout=3' )
+                );
 
         #}
 
@@ -1899,7 +2166,7 @@ sub mysql_setup {
             if ( length($userpath) > 0 ) {
                 chomp($userpath);
             }
-            unless ( -e "${userpath}/.my.cnf" or -e "${userpath}/.mylogin.cnf" )
+                        unless ( has_mysql_client_option_file($userpath) )
             {
                 badprint
                   "SECURITY RISK: Successfully authenticated without password";
@@ -1930,21 +2197,22 @@ sub mysql_setup {
             else {
                 print STDERR
                   "Please enter your MySQL administrative password: ";
-                system("stty -echo >$devnull 2>&1");
-                $password = <STDIN>;
-                system("stty echo >$devnull 2>&1");
+                if ($is_win) {
+                    $password = <STDIN>;
+                }
+                else {
+                    system("stty -echo >$devnull 2>&1");
+                    $password = <STDIN>;
+                    system("stty echo >$devnull 2>&1");
+                }
+                print STDERR "\n";
             }
             chomp($password);
             chomp($name);
             $mysqllogin = "$defaults_options -u $name ";
 
             if ( length($password) > 0 ) {
-                if ($is_win) {
-                    $mysqllogin .= " -p\"$password\"";
-                }
-                else {
-                    $mysqllogin .= " -p'$password'";
-                }
+                $mysqllogin .= ' ' . mysql_password_option($password);
             }
             $mysqllogin .= $remotestring;
             my $loginstatus =
@@ -1962,7 +2230,7 @@ sub mysql_setup {
                           || $ENV{USERPROFILE} )
                       : ( $ENV{HOME} // '' );
                     chomp($userpath);
-                    unless ( -e "$userpath/.my.cnf" ) {
+                    unless ( has_mysql_client_option_file($userpath) ) {
                         print STDERR "";
                         badprint
 "SECURITY RISK: Successfully authenticated without password";
@@ -2102,7 +2370,7 @@ sub select_one_g {
     }
     debugprint "select_array: return code : $?";
     chomp(@result);
-    return ( grep { /$pattern/ } @result )[0];
+    return ( grep { defined $_ && /$pattern/ } @result )[0];
 }
 
 sub select_str_g {
@@ -2178,12 +2446,15 @@ sub get_password_column_name {
     my $pass_column        = '';
     my $auth_column        = '';
 
-    if ( grep { /^authentication_string$/msx } @mysql_user_columns ) {
+    if ( grep { defined $_ && /^authentication_string$/msx }
+        @mysql_user_columns )
+    {
         $auth_column = 'authentication_string';
     }
 
     # Case-insensitive match for Password/password
-    my @pass_matches = grep { lc($_) eq 'password' } @mysql_user_columns;
+    my @pass_matches =
+      grep { defined $_ && lc($_) eq 'password' } @mysql_user_columns;
     if (@pass_matches) {
         $pass_column = $pass_matches[0];
     }
@@ -2471,42 +2742,71 @@ sub get_log_file_real_path {
     my $file     = shift;
     my $hostname = shift;
     my $datadir  = shift;
-    if ( -f "$file" ) {
-        return $file;
+    my @candidates = (
+        $file,
+        "$hostname.log",
+        "$hostname.err",
+    );
+
+    if ( defined $datadir && length $datadir ) {
+        push @candidates,
+          File::Spec->catfile( $datadir, "$hostname.err" ),
+          File::Spec->catfile( $datadir, "$hostname.log" ),
+          File::Spec->catfile( $datadir, 'mysql_error.log' );
     }
-    elsif ( -f "$hostname.log" ) {
-        return "$hostname.log";
-    }
-    elsif ( -f "$hostname.err" ) {
-        return "$hostname.err";
-    }
-    elsif ( -f "$datadir$hostname.err" ) {
-        return "$datadir$hostname.err";
-    }
-    elsif ( -f "$datadir$hostname.log" ) {
-        return "$datadir$hostname.log";
-    }
-    elsif ( -f "$datadir" . "mysql_error.log" ) {
-        return "$datadir" . "mysql_error.log";
-    }
-    elsif ( -f "/var/log/mysql.log" ) {
-        return "/var/log/mysql.log";
-    }
-    elsif ( -f "/var/log/mysqld.log" ) {
-        return "/var/log/mysqld.log";
-    }
-    elsif ( -f "/var/log/mysql/$hostname.err" ) {
-        return "/var/log/mysql/$hostname.err";
-    }
-    elsif ( -f "/var/log/mysql/$hostname.log" ) {
-        return "/var/log/mysql/$hostname.log";
-    }
-    elsif ( -f "/var/log/mysql/" . "mysql_error.log" ) {
-        return "/var/log/mysql/" . "mysql_error.log";
+
+    if ($is_win) {
+        for my $base ( grep { defined && length } $ENV{PROGRAMDATA} ) {
+            push @candidates,
+              glob( File::Spec->catfile( $base, 'MySQL', 'MySQL Server*', 'Data', "$hostname.err" ) ),
+              glob( File::Spec->catfile( $base, 'MySQL', 'MySQL Server*', 'Data', "$hostname.log" ) ),
+              glob( File::Spec->catfile( $base, 'MySQL', 'MySQL Server*', 'Data', 'mysql_error.log' ) );
+        }
     }
     else {
-        return $file;
+        push @candidates,
+          '/var/log/mysql.log',
+          '/var/log/mysqld.log',
+          "/var/log/mysql/$hostname.err",
+          "/var/log/mysql/$hostname.log",
+          '/var/log/mysql/mysql_error.log';
     }
+
+    for my $candidate (@candidates) {
+        return $candidate if defined $candidate && -f $candidate;
+    }
+
+    return $file;
+}
+
+sub find_nearby_log_files {
+    my ($path) = @_;
+    return () unless defined $path && $path ne '';
+
+    my $directory = File::Basename::dirname($path);
+    return () unless defined $directory && -d $directory;
+
+    opendir( my $dh, $directory ) or return ();
+    my @entries = grep {
+        defined $_
+          && $_ ne '.'
+          && $_ ne '..'
+          && /\.(?:err|log)$/i
+          && -f File::Spec->catfile( $directory, $_ )
+    } readdir($dh);
+    closedir($dh);
+
+    my $wanted = lc File::Basename::basename($path);
+    my @ranked = sort {
+           ( lc($a) eq $wanted ? 0 : 1 ) <=> ( lc($b) eq $wanted ? 0 : 1 )
+        || ( lc($a) =~ /\.err$/ ? 0 : 1 ) <=> ( lc($b) =~ /\.err$/ ? 0 : 1 )
+        || ( ( stat File::Spec->catfile( $directory, $b ) )[9] || 0 )
+         <=> ( ( stat File::Spec->catfile( $directory, $a ) )[9] || 0 )
+        || lc($a) cmp lc($b)
+    } @entries;
+
+    splice @ranked, 5 if @ranked > 5;
+    return map { File::Spec->catfile( $directory, $_ ) } @ranked;
 }
 
 sub log_file_recommendations {
@@ -2645,6 +2945,11 @@ sub log_file_recommendations {
     }
     else {
         badprint "Log file $myvar{'log_error'} doesn't exist";
+        my @candidates = find_nearby_log_files( $myvar{'log_error'} );
+        if (@candidates) {
+            infoprint "Nearby log file candidates:";
+            infoprint "  $_" for @candidates;
+        }
         return;
     }
 
@@ -2764,7 +3069,8 @@ sub cve_recommendations {
 sub get_opened_ports {
     my @opened_ports = execute_system_command('netstat -ltn');
     if ($is_win) {
-        @opened_ports = grep { /LISTEN/ } execute_system_command('netstat -n');
+        @opened_ports = grep { defined $_ && /LISTEN/ }
+          execute_system_command('netstat -n');
     }
     @opened_ports = map {
         my $v = $_;
@@ -2781,7 +3087,7 @@ sub get_opened_ports {
 
 sub is_open_port {
     my $port = shift;
-    if ( grep { /^$port$/ } get_opened_ports ) {
+    if ( grep { defined $_ && /^$port$/ } get_opened_ports ) {
         return 1;
     }
     return 0;
@@ -2865,6 +3171,14 @@ sub get_os_release {
         $os_release =~ s/\s+\\n.*//;
         return $os_release;
     }
+    if ($is_win) {
+        if ( eval { require Win32; 1 } ) {
+            return Win32::GetOSName();
+        }
+        my $ver = execute_system_command('ver');
+        $ver =~ s/\r?\n$//;
+        return $ver if $ver ne '';
+    }
     return "Unknown OS release";
 }
 
@@ -2920,31 +3234,33 @@ sub get_fs_info {
 }
 
 sub get_fs_info_win {
-    my @sinfo =
-      execute_system_command('wmic logicaldisk get Name,Size,FreeSpace');
+        my @records = parse_wmic_record_list(
+                execute_system_command('wmic logicaldisk get Caption,FreeSpace,Size /value')
+        );
 
-    foreach my $info (@sinfo) {
-        if ( $info =~ /^\s*(\d+)\s+(.*?)\s+(\d+)\s*$/ ) {
-            my ( $free, $name, $size ) = ( $1, $2, $3 );
-            my $used     = $size - $free;
-            my $free_pct = int( ( $free / $size ) * 100 );
-            my $used_pct = int( ( $used / $size ) * 100 );
-            if ( $used_pct > 85 ) {
-                badprint "Disk $name is using $used_pct % total space ("
-                  . human_size($used) . " / "
-                  . human_size($size) . ")";
-                push( @generalrec, "Add some space to DIsk $name." );
-            }
-            else {
-                infoprint "Disk $name is using $used_pct % total space ("
-                  . human_size($used) . " / "
-                  . human_size($size) . ")";
-            }
-            $result{'Filesystem'}{'Space Pct'}{$name}   = $used_pct;
-            $result{'Filesystem'}{'Used Space'}{$name}  = $used;
-            $result{'Filesystem'}{'Free Space'}{$name}  = $free;
-            $result{'Filesystem'}{'Total Space'}{$name} = $size;
-        }
+        foreach my $record (@records) {
+                my $name = $record->{Caption} || next;
+                my $free = extract_numeric_value( $record->{FreeSpace} );
+                my $size = extract_numeric_value( $record->{Size} );
+                next unless defined $free && defined $size && $size > 0;
+
+                my $used     = $size - $free;
+                my $used_pct = int( ( $used / $size ) * 100 );
+                if ( $used_pct > 85 ) {
+                        badprint "Disk $name is using $used_pct % total space ("
+                            . human_size($used) . " / "
+                            . human_size($size) . ")";
+                        push( @generalrec, "Add some space to disk $name." );
+                }
+                else {
+                        infoprint "Disk $name is using $used_pct % total space ("
+                            . human_size($used) . " / "
+                            . human_size($size) . ")";
+                }
+                $result{'Filesystem'}{'Space Pct'}{$name}   = $used_pct;
+                $result{'Filesystem'}{'Used Space'}{$name}  = $used;
+                $result{'Filesystem'}{'Free Space'}{$name}  = $free;
+                $result{'Filesystem'}{'Total Space'}{$name} = $size;
     }
 }
 
@@ -3113,6 +3429,14 @@ sub get_kernel_info {
 
 sub get_system_info {
     my $prefix = get_transport_prefix();
+    my $internal_ip        = '';
+    my $network_cards      = '';
+    my $name_servers       = '';
+    my $logged_users       = '';
+    my $free_memory_report = '';
+    my $load_average       = '';
+    my $uptime_info        = '';
+
     $result{'OS'}{'Release'} = get_os_release();
     infoprint get_os_release;
     if ( is_docker() || $opt{'container'} ) {
@@ -3174,35 +3498,59 @@ sub get_system_info {
     $result{'OS'}{'Hostname'} =
       ( !$is_win && $prefix eq '' ) ? $nodename : Sys::Hostname::hostname();
 
-    $result{'Network'}{'Internal Ip'} =
-      $is_win
-      ? execute_system_command(
-'ipconfig |perl -ne "if (/IPv. Address/) {print s/^.*?([\\d\\.]*)\\s*$/$1/r; exit; }"'
-      )
-      : execute_system_command('hostname -I');
+    if ($is_win) {
+        my @ipconfig = execute_system_command('ipconfig /all');
+        $internal_ip        = parse_windows_ipv4_from_ipconfig(@ipconfig);
+        $network_cards      = join( '', @ipconfig );
+        $name_servers       = parse_windows_nameservers_from_ipconfig(@ipconfig);
+        $logged_users       = get_windows_logged_users();
+        $free_memory_report = get_windows_free_memory_report();
+        $load_average       = 'N/A on Windows';
+        $uptime_info        = get_windows_last_boot_time();
+    }
+    else {
+        $internal_ip = execute_system_command('hostname -I');
+        if ( which( "ip", $ENV{'PATH'} ) ) {
+            $network_cards = execute_system_command('ip addr | grep -A1 mtu');
+        }
+        elsif ( which( "ifconfig", $ENV{'PATH'} ) ) {
+            $network_cards = execute_system_command('ifconfig| grep -A1 mtu');
+        }
+        if ( $prefix eq '' && open( my $ns_file, '<', '/etc/resolv.conf' ) ) {
+            my @ns_list;
+            while (<$ns_file>) {
+                push @ns_list, $1 if /^\s*nameserver\s+([^\s]+)/;
+            }
+            close $ns_file;
+            $name_servers = join( ', ', @ns_list );
+        }
+        else {
+            $name_servers =
+              infocmd_one "grep 'nameserver' /etc/resolv.conf \| awk '{print \$2}'";
+        }
+        $logged_users       = execute_system_command('who');
+        $free_memory_report = execute_system_command('free -m | grep -v +');
+        $load_average = execute_system_command("top -n 1 -b | grep 'load average:'");
+        $uptime_info  = execute_system_command('uptime');
+    }
+
+    $result{'Network'}{'Internal Ip'} = $internal_ip;
     infoprint "Hostname              : "
       . (
         ( !$is_win && $prefix eq '' ) ? $nodename : Sys::Hostname::hostname() );
     infoprint "Network Cards         : ";
 
-    if ( which( "ip", $ENV{'PATH'} ) ) {
+    if ($is_win) {
+        infoprintml split /\n/, $network_cards;
+    }
+    elsif ( which( "ip", $ENV{'PATH'} ) ) {
         infocmd_tab "ip addr | grep -A1 mtu";
     }
     elsif ( which( "ifconfig", $ENV{'PATH'} ) ) {
         infocmd_tab "ifconfig| grep -A1 mtu";
     }
-    infoprint "Internal IP           : "
-      . ( ( !$is_win && $prefix eq '' )
-        ? execute_system_command('hostname -I')
-        : infocmd_one "hostname -I" );
-    if ( which( "ip", $ENV{'PATH'} ) ) {
-        $result{'Network'}{'Internal Ip'} =
-          execute_system_command('ip addr | grep -A1 mtu');
-    }
-    elsif ( which( "ifconfig", $ENV{'PATH'} ) ) {
-        $result{'Network'}{'Internal Ip'} =
-          execute_system_command('ifconfig| grep -A1 mtu');
-    }
+    infoprint "Internal IP           : " . $internal_ip;
+    $result{'Network'}{'Network Cards'} = $network_cards;
     my $httpcli = get_http_cli();
     infoprint "HTTP client found: $httpcli" if defined $httpcli;
 
@@ -3221,36 +3569,42 @@ sub get_system_info {
     badprint "External IP           : Can't check, no Internet connectivity"
       unless defined($httpcli);
 
-    my $ns_str = "";
-    if ( $prefix eq '' && open( my $ns_file, '<', '/etc/resolv.conf' ) ) {
-        my @ns_list;
-        while (<$ns_file>) {
-            push @ns_list, $1 if /^\s*nameserver\s+([^\s]+)/;
-        }
-        close $ns_file;
-        $ns_str = join( ', ', @ns_list );
-    }
-    else {
-        $ns_str =
-          infocmd_one "grep 'nameserver' /etc/resolv.conf \| awk '{print \$2}'";
-    }
-    infoprint "Name Servers          : " . $ns_str;
+    infoprint "Name Servers          : " . $name_servers;
+    $result{'Network'}{'Name Servers'} = $name_servers;
 
     infoprint "Logged In users       : ";
-    infocmd_tab "who";
-    $result{'OS'}{'Logged users'} = execute_system_command('who');
+    if ($is_win) {
+        infoprintml split /\n/, $logged_users;
+    }
+    else {
+        infocmd_tab "who";
+    }
+    $result{'OS'}{'Logged users'} = $logged_users;
     infoprint "Ram Usages in MB      : ";
-    infocmd_tab "free -m | grep -v +";
-    $result{'OS'}{'Free Memory RAM'} =
-      execute_system_command('free -m | grep -v +');
+    if ($is_win) {
+        infoprint "\t$free_memory_report";
+    }
+    else {
+        infocmd_tab "free -m | grep -v +";
+    }
+    $result{'OS'}{'Free Memory RAM'} = $free_memory_report;
     infoprint "Load Average          : ";
-    infocmd_tab "top -n 1 -b | grep 'load average:'";
-    $result{'OS'}{'Load Average'} =
-      execute_system_command("top -n 1 -b | grep 'load average:'");
+    if ($is_win) {
+        infoprint "\t$load_average";
+    }
+    else {
+        infocmd_tab "top -n 1 -b | grep 'load average:'";
+    }
+    $result{'OS'}{'Load Average'} = $load_average;
 
     infoprint "System Uptime         : ";
-    infocmd_tab "uptime";
-    $result{'OS'}{'Uptime'} = execute_system_command('uptime');
+    if ($is_win) {
+        infoprint "\t$uptime_info";
+    }
+    else {
+        infocmd_tab "uptime";
+    }
+    $result{'OS'}{'Uptime'} = $uptime_info;
 }
 
 sub system_recommendations {
@@ -3616,8 +3970,14 @@ q{SELECT CONCAT(QUOTE(user), '@', QUOTE(host)) FROM mysql.global_priv WHERE
         foreach my $p ( "true", "false",
             "RA-ND-OM-P-ASS-W-ORD-" . int( rand(100000) ) )
         {
-            my $check_cmd =
-"$mysqlcmd $mysqllogin -u $target_user -p'$p' -Nrs -e 'select \"mysqld is alive\";' 2>$devnull";
+            my $check_cmd = join_command_parts(
+                build_mysql_alive_check_command(
+                    $mysqlcmd,
+                    join_command_parts( $mysqllogin, "-u $target_user",
+                        mysql_password_option($p) )
+                ),
+                "2>$devnull"
+            );
             my $alive_res = execute_system_command($check_cmd);
             if ( $alive_res =~ /mysqld is alive/ ) {
                 infoprint
@@ -3677,9 +4037,14 @@ q{SELECT CONCAT(QUOTE(user), '@', QUOTE(host)) FROM mysql.global_priv WHERE
                     my $target_user = $opt{user} || 'root';
                     my @variants    = ( $pass, uc($pass), ucfirst($pass) );
                     foreach my $v (@variants) {
-                        my $check_login = "$mysqllogin -u $target_user -p'$v'";
-                        my $alive_res   = execute_system_command(
-"$mysqlcmd -Nrs -e 'select \"mysqld is alive\";' $check_login 2>$devnull"
+                        my $check_login = join_command_parts( $mysqllogin,
+                            "-u $target_user", mysql_password_option($v) );
+                        my $alive_res = execute_system_command(
+                            join_command_parts(
+                                build_mysql_alive_check_command(
+                                    $mysqlcmd, $check_login ),
+                                "2>$devnull"
+                            )
                         );
                         if ( $alive_res =~ /mysqld is alive/ ) {
                             badprint
@@ -3919,9 +4284,19 @@ sub check_architecture {
         return;
     }
     elsif ($is_win) {
-        if ( execute_system_command('wmic os get osarchitecture') =~ /64/ ) {
+        my $values =
+          parse_key_value_output(
+            execute_system_command('wmic os get osarchitecture /value') );
+        my $os_arch =
+             $values->{OSArchitecture}
+          || $ENV{PROCESSOR_ARCHITECTURE}
+          || '';
+        if ( $os_arch =~ /64/i ) {
             goodprint "Operating on 64-bit architecture";
             $arch = 64;
+        }
+        else {
+            $arch = 32;
         }
     }
     else {
@@ -4067,16 +4442,12 @@ sub check_storage_engines {
         my @templist = select_array
 "SELECT ENGINE, SUM(DATA_LENGTH+INDEX_LENGTH), COUNT(ENGINE), SUM(DATA_LENGTH), SUM(INDEX_LENGTH) FROM information_schema.TABLES WHERE TABLE_SCHEMA NOT IN ('information_schema', 'performance_schema', 'mysql') AND ENGINE IS NOT NULL GROUP BY ENGINE ORDER BY ENGINE ASC;";
 
-        my ( $engine, $size, $count, $dsize, $isize );
         foreach my $line (@templist) {
-            ( $engine, $size, $count, $dsize, $isize ) =
-              $line =~ /([a-zA-Z_]+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/;
+                        next unless defined $line;
+                        my ( $engine, $size, $count, $dsize, $isize ) =
+                            $line =~ /^([a-zA-Z_]+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)$/;
             debugprint "Engine Found: $engine";
-            next unless ( defined($engine) or trim($engine) eq '' );
-            $size  = 0 unless ( defined($size)  or trim($engine) eq '' );
-            $isize = 0 unless ( defined($isize) or trim($engine) eq '' );
-            $dsize = 0 unless ( defined($dsize) or trim($engine) eq '' );
-            $count = 0 unless ( defined($count) or trim($engine) eq '' );
+                        next unless defined($engine) && trim($engine) ne '';
             $enginestats{$engine}                      = $size;
             $enginecount{$engine}                      = $count;
             $result{'Engine'}{$engine}{'Table Number'} = $count;
@@ -4198,8 +4569,15 @@ sub check_storage_engines {
         my $total_free            = 0;
         my $fragmented_tables_csv = "schema,table,free_space_mb,sql\n";
         foreach my $table_line ( @{ $result{'Tables'}{'Fragmented tables'} } ) {
+                        next unless defined $table_line;
             my ( $table_schema, $table_name, $engine, $data_free ) =
               split /\t/msx, $table_line;
+                        next
+                            unless defined $table_schema
+                            && defined $table_name
+                            && defined $engine
+                            && defined $data_free
+                            && $data_free =~ /^-?\d+(?:\.\d+)?$/;
             $data_free = $data_free / 1024 / 1024;
             $total_free += $data_free;
             my $generalrec;
@@ -4261,6 +4639,7 @@ sub check_storage_engines {
     foreach my $db (@dbnames) {
         foreach my $tbl ( @{ $tblist{$db} } ) {
             my ( $name, $autoincrement ) = @$tbl;
+            next unless defined $name && defined $autoincrement;
 
             if ( $autoincrement =~ /^\d+?$/ ) {
                 my $percent = percentage( $autoincrement, $maxint );
@@ -4469,8 +4848,8 @@ sub calculations {
             my @allfiles =
               execute_system_command("dir /-c /s $myvar{'datadir'}");
             foreach (
-                map  { /^\s*\d+\/\S+\s+\S+\s+(A|P)M\s+(\d+)\s/i; $2 }
-                grep { /\.MYI$/i } @allfiles
+                                map  { /^\s*\d+\/\S+\s+\S+\s+(A|P)M\s+(\d+)\s/i; $2 }
+                                grep { defined $_ && /\.MYI$/i } @allfiles
               )
             {
                 $size += $_;
@@ -4478,8 +4857,8 @@ sub calculations {
             $mycalc{'total_myisam_indexes'} = $size;
             $size = 0;
             foreach (
-                map  { /^\s*\d+\/\S+\s+\S+\s+(A|P)M\s+(\d+)\s/i; $2 }
-                grep { /\.MAI$/i } @allfiles
+                                map  { /^\s*\d+\/\S+\s+\S+\s+(A|P)M\s+(\d+)\s/i; $2 }
+                                grep { defined $_ && /\.MAI$/i } @allfiles
               )
             {
                 $size += $_;
@@ -5649,7 +6028,7 @@ sub get_pf_memory {
     return 0 unless defined $myvar{'performance_schema'};
     return 0 if $myvar{'performance_schema'} eq 'OFF';
 
-    my @infoPFSMemory = grep { /\tperformance_schema[.]memory\t/msx }
+        my @infoPFSMemory = grep { defined $_ && /\tperformance_schema[.]memory\t/msx }
       select_array("SHOW ENGINE PERFORMANCE_SCHEMA STATUS");
     @infoPFSMemory == 1 || return 0;
     $infoPFSMemory[0] =~ s/.*\s+(\d+)$/$1/g;
@@ -9675,21 +10054,46 @@ sub dump_result {
 sub which {
     my $prog_name   = shift;
     my $path_string = shift;
-    my @path_array  = split /:/, $ENV{'PATH'};
-    if ($is_win) { @path_array = split /;/, $ENV{'PATH'} =~ s/\\/\//gr; }
+    return undef unless defined $prog_name && length $prog_name;
 
-    for my $path (@path_array) {
-        if ($is_win) {
-            return "$path/$prog_name.exe" if ( -x "$path/$prog_name.exe" );
-            return "$path/$prog_name.com" if ( -x "$path/$prog_name.com" );
-            return "$path/$prog_name.bat" if ( -x "$path/$prog_name.bat" );
-        }
-        else {
-            return "$path/$prog_name" if ( -x "$path/$prog_name" );
+    my $search_path = defined $path_string ? $path_string : ( $ENV{'PATH'} // '' );
+    my $path_separator = $is_win ? qr/;/ : qr/:/;
+    my @path_array  = split( $path_separator, $search_path );
+    my @extensions  = ('');
+
+    if ($is_win) {
+        my %seen_ext;
+        @extensions = grep { !$seen_ext{$_}++ }
+          ( '', split( /;/, $ENV{'PATHEXT'} || '.COM;.EXE;.BAT;.CMD' ) );
+    }
+
+    if ( $prog_name =~ m{[\\/]} || ( $is_win && $prog_name =~ /^[A-Za-z]:/ ) ) {
+        for my $ext (@extensions) {
+            my $candidate = $prog_name;
+            $candidate .= $ext
+              if $is_win
+              && $ext ne ''
+              && $candidate !~ /\Q$ext\E$/i;
+            return $candidate if is_command_path_usable($candidate);
         }
     }
 
-    return 0;
+    for my $path (@path_array) {
+        next unless defined $path && length $path;
+        for my $ext (@extensions) {
+            my $candidate = $prog_name;
+            $candidate .= $ext
+              if $is_win
+              && $ext ne ''
+              && $candidate !~ /\Q$ext\E$/i;
+            my $full_path = File::Spec->catfile( $path, $candidate );
+            if ( is_command_path_usable($full_path) ) {
+                return $full_path;
+            }
+        }
+    }
+
+    return undef;
 }
 
 sub dump_csv_files {
@@ -9737,6 +10141,7 @@ sub dump_csv_files {
     # Store all sys schema in dumpdir if defined
     infoprint("Dumping sys schema");
     for my $sys_view ( select_array('use sys;show tables;') ) {
+        next unless defined $sys_view && $sys_view ne '';
         if ( $sys_view =~ /innodb_buffer_stats/ ) {
             infoprint("SKIPPING $sys_view");
             next;
@@ -9752,6 +10157,7 @@ sub dump_csv_files {
     infoprint("Dumping information schema");
     for my $info_s_table ( select_array('use information_schema;show tables;') )
     {
+        next unless defined $info_s_table && $info_s_table ne '';
         next if $info_s_table =~ /INNODB_BUFFER_PAGE/;
         infoprint "Dumping $info_s_table into $opt{dumpdir}";
         select_csv_file(
@@ -9765,6 +10171,7 @@ sub dump_csv_files {
     for
       my $info_pf_table ( select_array('use performance_schema;show tables;') )
     {
+                next unless defined $info_pf_table && $info_pf_table ne '';
         next if $info_pf_table =~ /^events_/;
         infoprint
           "Performance Schema Dumping $info_pf_table into $opt{dumpdir}";

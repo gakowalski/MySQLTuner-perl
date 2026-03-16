@@ -4,16 +4,25 @@ use warnings;
 use Test::More;
 use File::Temp qw(tempfile);
 use File::Basename;
+use File::Spec;
+
+no warnings 'once';
 
 # Mock environment
-$main::devnull = '/dev/null';
+$main::devnull = File::Spec->devnull();
 $main::is_win = 0;
 $main::transport_prefix = '';
 $main::mysqlcmd = 'mysql';
 $main::mysqladmincmd = 'mysqladmin';
+$main::info = '[--]';
+$main::good = '[OK]';
+$main::bad = '[!!]';
+$main::deb = '[DG]';
 
 # Require the script but we need to prevent it from running itself
 {
+    my $mock_bin = File::Spec->catdir( File::Spec->tmpdir(), 'mysqltuner-tests-bin' );
+    mkdir $mock_bin unless -d $mock_bin;
     local @ARGV = (); # Avoid GetOptions parsing from test ARGV
     no warnings 'redefine';
     require './mysqltuner.pl';
@@ -27,9 +36,9 @@ $main::mysqladmincmd = 'mysqladmin';
     *main::goodprint = sub { diag "GOOD: $_[0]" };
     *main::debugprint = sub { diag "DEBUG: $_[0]" };
     *main::subheaderprint = sub { diag "SUBHEADER: $_[0]" };
-    *main::is_remote = sub { return 1; };
+    *main::is_remote = sub () { return 1; };
     *main::get_transport_prefix = sub { return ''; };
-    *main::which = sub { return "/usr/bin/$_[0]"; };
+    *main::which = sub { return $^X; };
     *main::execute_system_command = sub { 
         my ($cmd) = @_;
         diag "MOCK CMD: $cmd";

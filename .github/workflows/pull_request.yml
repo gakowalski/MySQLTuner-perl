@@ -82,3 +82,25 @@ jobs:
       # Runs a single command using the runners shell
       - name: Run verbose mode
         run: sudo perl ./mysqltuner.pl --user=root --pass=root --protocol tcp --verbose
+
+  test_windows_unit:
+    name: Windows unit and portability tests
+    runs-on: windows-latest
+
+    steps:
+      - name: Setup MySQL Tuner repository
+        uses: actions/checkout@v4
+
+      - name: Setup Perl
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.38'
+
+      - name: Verify Perl toolchain
+        run: |
+          perl -v
+          prove --version
+
+      - name: Run Windows-safe unit tests
+        run: |
+          prove tests/unit_utilities.t tests/cli_options.t tests/sql_quoting.t tests/repro_issue_490.t tests/repro_issue_605.t tests/modeling_regression.t tests/test_audit_logs.t

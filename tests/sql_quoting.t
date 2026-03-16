@@ -2,12 +2,13 @@
 use strict;
 use warnings;
 use Test::More;
+use File::Spec;
 
 # Mocking variables and functions from mysqltuner.pl
 our %opt = ( container => 'test_container' );
 our $mysqlcmd = "mysql";
 our $mysqllogin = "-u root";
-our $devnull = "/dev/null";
+our $devnull = File::Spec->devnull();
 
 my $captured_cmd = "";
 
@@ -44,25 +45,25 @@ plan tests => 4;
 # Test Case 1: Query with double quotes (the original bug)
 my $query = 'select CONCAT(table_schema, ".", table_name, " (", redundant_index_name, ") redundant of ", dominant_index_name, " - SQL: ", sql_drop_index) from sys.schema_redundant_indexes;';
 select_array($query);
-my $expected = 'mysql -u root -Bse "\wselect CONCAT(table_schema, \".\", table_name, \" (\", redundant_index_name, \") redundant of \", dominant_index_name, \" - SQL: \", sql_drop_index) from sys.schema_redundant_indexes;" 2>>/dev/null';
+my $expected = qq(mysql -u root -Bse "\\wselect CONCAT(table_schema, \\".\\", table_name, \\" (\\", redundant_index_name, \\") redundant of \\", dominant_index_name, \\" - SQL: \\", sql_drop_index) from sys.schema_redundant_indexes;" 2>>$devnull);
 is($captured_cmd, $expected, "SQL query with double quotes should be correctly escaped (select_array)");
 
 # Test Case 2: Simple query
 $query = 'SHOW VARIABLES';
 select_array($query);
-$expected = 'mysql -u root -Bse "\wSHOW VARIABLES" 2>>/dev/null';
+$expected = qq(mysql -u root -Bse "\\wSHOW VARIABLES" 2>>$devnull);
 is($captured_cmd, $expected, "Simple SQL query should remain intact (select_array)");
 
 # Test Case 3: select_array_with_headers with double quotes
 $query = 'select "complex" as col';
 select_array_with_headers($query);
-$expected = 'mysql -u root -Bre "\wselect \"complex\" as col" 2>>/dev/null';
+$expected = qq(mysql -u root -Bre "\\wselect \\"complex\\" as col" 2>>$devnull);
 is($captured_cmd, $expected, "SQL query with double quotes should be correctly escaped (select_array_with_headers)");
 
 # Test Case 4: verify no regression for single quotes (handled by execute_system_command later but should not be affected here)
 $query = "select 'simple' as col";
 select_array($query);
-$expected = "mysql -u root -Bse \"\\wselect 'simple' as col\" 2>>/dev/null";
+$expected = qq(mysql -u root -Bse "\\wselect 'simple' as col" 2>>$devnull);
 is($captured_cmd, $expected, "Single quotes should remain intact in select_array");
 
 done_testing();

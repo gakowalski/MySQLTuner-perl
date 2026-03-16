@@ -2,6 +2,9 @@
 use strict;
 use warnings;
 use Test::More;
+use File::Spec;
+
+no warnings 'once';
 
 # 1. Global mocks before loading
 BEGIN {
@@ -19,6 +22,7 @@ our %opt = (
 );
 our %myvar = (
     'version' => '8.0.32',
+    'version_comment' => '',
     'lower_case_table_names' => '0',
 );
 our %mystat = ();
@@ -26,7 +30,7 @@ our @generalrec = ();
 our @modeling = ();
 our $mysqlcmd = 'mysql';
 our $mysqllogin = '';
-our $devnull = '/dev/null';
+our $devnull = File::Spec->devnull();
 
 # Capture output
 our @captured_output = ();
@@ -68,6 +72,10 @@ sub mock_select_array {
 # 3. Load the script
 {
     local @ARGV = ('--help'); # Minimize impact
+    $main::info = '[--]';
+    $main::good = '[OK]';
+    $main::bad = '[!!]';
+    $main::deb = '[DG]';
     eval { require "./mysqltuner.pl"; };
     # ignore EXIT_CALLED or other errors from the main part
 }

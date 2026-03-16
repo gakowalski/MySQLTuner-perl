@@ -10,8 +10,9 @@ use File::Spec;
 
 my $audit_script = 'build/audit_logs.pl';
 
-# 1. Check if script exists and is executable
-ok(-x $audit_script, 'Audit script is executable');
+# 1. Check if script exists and is readable for perl execution
+ok(-f $audit_script, 'Audit script exists');
+ok(-r $audit_script, 'Audit script is readable');
 
 # 2. Test with no anomalies
 sub test_no_anomalies {
