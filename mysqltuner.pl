@@ -62,6 +62,8 @@ sub mysql_password_option;
 sub mysql_alive_query;
 sub build_mysql_alive_check_command;
 sub find_nearby_log_files;
+sub select_preferred_container_name;
+sub detect_database_container_name;
 
 #use Data::Dumper;
 #$Data::Dumper::Pair = " : ";
@@ -565,7 +567,8 @@ our %opt = map {
 # Declare shared variables at top level
 our (
     $devnull,       $basic_password_files, $outputfile,
-    $fh,            $me,                   $good,
+    $fh,            $raw_fh,               $me,
+    $good,
     $bad,           $info,                 $deb,
     $cmd,           $end,                  $maxlines,
     $mysqlvermajor, $mysqlverminor,        $mysqlvermicro,
@@ -689,10 +692,12 @@ sub setup_environment {
     $opt{'bannedports'} = '' unless defined( $opt{'bannedports'} );
     @banned_ports       = split ',', $opt{'bannedports'};
 
-    $outputfile = undef;
-    $outputfile = abs_path( $opt{outputfile} ) unless $opt{outputfile} eq "0";
+        $outputfile = undef;
+        $outputfile = File::Spec->rel2abs( $opt{outputfile} )
+            unless $opt{outputfile} eq "0";
 
     $fh = undef;
+        $raw_fh = undef;
     open( $fh, '>', $outputfile )
       or die("Fail opening $outputfile")
       if defined($outputfile);
@@ -817,6 +822,7 @@ sub show_help {
 sub prettyprint {
     print $_[0] . "\n" unless ( $opt{'silent'} or $opt{'json'} );
     print $fh $_[0] . "\n" if defined($fh);
+    print $raw_fh $_[0] . "\n" if defined($raw_fh);
 }
 
 sub goodprint {
@@ -2809,6 +2815,54 @@ sub find_nearby_log_files {
     return map { File::Spec->catfile( $directory, $_ ) } @ranked;
 }
 
+sub select_preferred_container_name {
+    my @lines = @_;
+
+    my @containers;
+    for my $line (@lines) {
+        next unless defined $line;
+        $line = trim($line);
+        next unless $line ne '';
+
+        my ( $name, $image ) = split /	/, $line, 2;
+        $name  = trim($name);
+        $image = trim( $image // '' );
+        next if $name eq '';
+        next if $name =~ /(?:traefik|haproxy|maxscale|maxsale|proxy)/i;
+
+        push @containers,
+          {
+            name     => $name,
+            image    => $image,
+                        database => scalar(
+                                $name =~ /(?:mysql|mariadb|percona|db|database)/i
+                                    || $image =~ /(?:mysql|mariadb|percona|db|database)/i
+                        )
+          };
+    }
+
+    my ($database_container) = grep { $_->{database} } @containers;
+    return $database_container->{name} if defined $database_container;
+    return $containers[0]{name} if @containers;
+    return '';
+}
+
+sub detect_database_container_name {
+    my ( $container_cmd, $port ) = @_;
+    return '' unless defined $container_cmd && $container_cmd ne '';
+
+    my @by_port = execute_system_command(
+        "$container_cmd ps --filter \"publish=$port\" --format \"{{.Names}}\t{{.Image}}\""
+    );
+    my $container = select_preferred_container_name(@by_port);
+    return $container if $container ne '';
+
+    my @all = execute_system_command(
+        "$container_cmd ps --format \"{{.Names}}\t{{.Image}}\""
+    );
+    return select_preferred_container_name(@all);
+}
+
 sub log_file_recommendations {
     my $has_pfs_error_log = 0;
     if ( $opt{'dbstat'} ) {
@@ -2860,18 +2914,8 @@ sub log_file_recommendations {
 
         if ( $container_cmd ne "" ) {
             my $port = $opt{'port'} || 3306;
-            my $container =
-              execute_system_command(
-"$container_cmd ps --filter \"publish=$port\" --format \"{{.Names}}\" | grep -vEi \"traefik|haproxy|maxscale|maxsale|proxy\" | head -n 1"
-              );
-            chomp $container;
-            if ( $container eq "" ) {
-                $container =
-                  execute_system_command(
-"$container_cmd ps --format \"{{.Names}} {{.Image}}\" | grep -Ei \"mysql|mariadb|percona|db|database\" | grep -vEi \"traefik|haproxy|maxscale|maxsale|proxy\" | head -n 1 | awk '{print \$1}'"
-                  );
-                chomp $container;
-            }
+                        my $container = detect_database_container_name( $container_cmd,
+                                $port );
             if ( $container ne "" ) {
                 $myvar{'log_error'} = "$container_cmd:$container";
                 debugprint "Detected $container_cmd container: $container";
@@ -9928,6 +9972,7 @@ sub make_recommendations {
 
 sub close_outputfile {
     close($fh) if defined($fh);
+    close($raw_fh) if defined($raw_fh);
 }
 
 sub headerprint {
@@ -10116,7 +10161,7 @@ sub dump_csv_files {
    # If outputfile is not already set, use raw_mysqltuner.txt as the main output
     if ( $opt{outputfile} eq 0 ) {
         $opt{outputfile} = $raw_output_file;
-        my $outputfile_path = abs_path( $opt{outputfile} );
+                my $outputfile_path = File::Spec->rel2abs( $opt{outputfile} );
         open( $fh, '>', $outputfile_path )
           or die("Failed to open $outputfile_path for writing: $!");
         $opt{nocolor} = 1;    # Disable colors in file output
@@ -10124,18 +10169,11 @@ sub dump_csv_files {
 
     # If outputfile is already set, create a second file handle for raw output
     else {
-        my $raw_fh;
-        open( $raw_fh, '>', $raw_output_file )
+                my $target = File::Spec->rel2abs( $opt{outputfile} );
+                if ( $target ne File::Spec->rel2abs($raw_output_file) ) {
+                        open( $raw_fh, '>', $raw_output_file )
           or die("Failed to open $raw_output_file for writing: $!");
-
-        # Duplicate all output to both file handles
-        # We'll need to modify prettyprint to write to both $fh and $raw_fh
-        # For now, just create a symlink
-        close($raw_fh);
-        unlink($raw_output_file);
-        my $target = abs_path( $opt{outputfile} );
-        symlink( $target, $raw_output_file )
-          or warn("Could not create symlink $raw_output_file -> $target: $!");
+                }
     }
 
     # Store all sys schema in dumpdir if defined
@@ -10150,7 +10188,7 @@ sub dump_csv_files {
         my $sys_view_table = $sys_view;
         $sys_view_table =~ s/\$/\\\$/g;
         select_csv_file( "$opt{dumpdir}/sys_$sys_view.csv",
-            'select * from sys.\`' . $sys_view_table . '\`' );
+            'select * from sys.`' . $sys_view_table . '`' );
     }
 
     # Store all information schema in dumpdir if defined

@@ -3,6 +3,7 @@ use warnings;
 use Test::More;
 use File::Basename;
 use File::Spec;
+use File::Temp qw(tempfile);
 
 no warnings 'once';
 
@@ -163,6 +164,52 @@ subtest 'execute_system_command respects stderr redirection' => sub {
     );
 
     is($out, "stdout\n", 'Does not re-enable stderr when the command already redirects it');
+};
+
+subtest 'select_preferred_container_name filters proxy containers' => sub {
+    is(
+        main::select_preferred_container_name(
+            "traefik\ttraefik:v3\n",
+            "db-main\tmariadb:11.8\n",
+            "haproxy\thaproxy:latest\n",
+        ),
+        'db-main',
+        'Prefers database container and skips proxy-like names'
+    );
+
+    is(
+        main::select_preferred_container_name(
+            "proxy-sidecar\tcustom:1\n",
+            "misc-app\tbusybox:latest\n",
+        ),
+        'misc-app',
+        'Falls back to first non-proxy container when no database image is present'
+    );
+};
+
+subtest 'prettyprint writes to primary and raw handles' => sub {
+    my ( $primary_fh, $primary_path ) = tempfile();
+    my ( $raw_fh,     $raw_path )     = tempfile();
+
+    local $main::fh = $primary_fh;
+    local $main::raw_fh = $raw_fh;
+    local $main::opt{silent} = 1;
+    local $main::opt{json} = 0;
+
+    main::prettyprint('dual-output-line');
+    close $primary_fh;
+    close $raw_fh;
+
+    open my $primary_read, '<', $primary_path or die $!;
+    my $primary_content = do { local $/; <$primary_read> };
+    close $primary_read;
+
+    open my $raw_read, '<', $raw_path or die $!;
+    my $raw_content = do { local $/; <$raw_read> };
+    close $raw_read;
+
+    is( $primary_content, "dual-output-line\n", 'Writes to primary output handle' );
+    is( $raw_content, "dual-output-line\n", 'Writes to raw dump output handle' );
 };
 
 done_testing();
