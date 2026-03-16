@@ -129,6 +129,7 @@ subtest 'windows mysql command quoting' => sub {
     local $main::is_win = 1;
 
     my $mysql_exe = 'C:\\Program Files\\MariaDB 11.8\\bin\\mysql.exe';
+    my $mysqladmin_exe = 'C:\\Program Files\\MariaDB 11.8\\bin\\mysqladmin.exe';
 
     is(
         main::quote_command_path($mysql_exe),
@@ -149,6 +150,15 @@ subtest 'windows mysql command quoting' => sub {
         ),
         qq("$mysql_exe" --defaults-file="C:\\Program Files\\MariaDB 11.8\\my.ini" -u root -h 100.126.31.15 -P 3306 -Nrs -e "select 'mysqld is alive';"),
         'Builds Windows-safe mysql alive check command'
+    );
+
+    is(
+        main::build_mysqladmin_ping_command(
+            main::quote_command_path($mysqladmin_exe),
+            '--defaults-file="C:\\Program Files\\MariaDB 11.8\\my.ini" -u root -h 100.126.31.15 -P 3306'
+        ),
+        qq("$mysqladmin_exe" --defaults-file="C:\\Program Files\\MariaDB 11.8\\my.ini" -u root -h 100.126.31.15 -P 3306 ping),
+        'Builds Windows-safe mysqladmin ping command'
     );
 };
 
@@ -185,6 +195,76 @@ subtest 'select_preferred_container_name filters proxy containers' => sub {
         'misc-app',
         'Falls back to first non-proxy container when no database image is present'
     );
+};
+
+subtest 'execute_windows_management_command falls back to powershell' => sub {
+    local $main::is_win = 1;
+    my @commands;
+
+    no warnings 'redefine';
+    local *main::which = sub {
+        my ($name) = @_;
+        return undef if $name eq 'wmic';
+        return 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'
+          if $name eq 'powershell';
+        return undef;
+    };
+    local *main::execute_system_command = sub {
+        my ($cmd) = @_;
+        push @commands, $cmd;
+        return "NumberOfCores=8\n";
+    };
+
+    my $out = scalar main::execute_windows_management_command(
+        'wmic cpu get NumberOfCores /value',
+        q{$total = 8; "NumberOfCores=$total"}
+    );
+
+    is( $out, "NumberOfCores=8\n", 'Returns output from PowerShell fallback' );
+    like( $commands[0], qr/powershell\.exe(?:"|) -NoProfile -NonInteractive -Command /i,
+        'Builds a PowerShell fallback command when wmic is unavailable' );
+};
+
+subtest 'get_windows_logged_users falls back to powershell' => sub {
+    local $main::is_win = 1;
+
+    no warnings 'redefine';
+    local *main::which = sub {
+        my ($name) = @_;
+        return undef if $name eq 'query' || $name eq 'wmic';
+        return 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'
+          if $name eq 'powershell';
+        return undef;
+    };
+    local *main::execute_system_command = sub {
+        my ($cmd) = @_;
+        return "DOMAIN\\Admin\n"
+          if $cmd =~ /powershell\.exe/i;
+        return '';
+    };
+
+    my $users = scalar main::get_windows_logged_users();
+    is( $users, "DOMAIN\\Admin\n", 'Falls back to PowerShell for logged users on Windows' );
+};
+
+subtest 'is_virtual_machine falls back to powershell' => sub {
+    local $main::is_win = 1;
+
+    no warnings 'redefine';
+    local *main::get_transport_prefix = sub { return ''; };
+    local *main::which = sub {
+        my ($name) = @_;
+        return 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'
+          if $name eq 'powershell';
+        return undef;
+    };
+    local *main::execute_system_command = sub {
+        my ($cmd) = @_;
+        return "virtual\n" if $cmd =~ /powershell\.exe/i;
+        return '';
+    };
+
+    ok( main::is_virtual_machine(), 'Detects virtual machine from PowerShell fallback' );
 };
 
 subtest 'prettyprint writes to primary and raw handles' => sub {

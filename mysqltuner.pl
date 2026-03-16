@@ -64,6 +64,9 @@ sub build_mysql_alive_check_command;
 sub find_nearby_log_files;
 sub select_preferred_container_name;
 sub detect_database_container_name;
+sub get_windows_shell_path;
+sub execute_windows_powershell_command;
+sub execute_windows_management_command;
 
 #use Data::Dumper;
 #$Data::Dumper::Pair = " : ";
@@ -968,9 +971,11 @@ sub cpu_cores {
         return $cntCPU + 0;
     }
     if ($is_win) {
-                my $values =
-                    parse_key_value_output(
-                        execute_system_command('wmic cpu get NumberOfCores /value') );
+            my $values = parse_key_value_output(
+                execute_windows_management_command(
+                    'wmic cpu get NumberOfCores /value',
+                    q{$total = (Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfCores -Sum).Sum; "NumberOfCores=$total"}
+                ) );
                 my $cntCPU = extract_numeric_value( $values->{NumberOfCores} );
                 return $cntCPU + 0 if defined $cntCPU;
                 return ( $ENV{NUMBER_OF_PROCESSORS} || 0 ) + 0;
@@ -1006,9 +1011,11 @@ sub logical_cpu_cores {
         return $cntCPU + 0;
     }
     if ($is_win) {
-                my $values = parse_key_value_output(
-                        execute_system_command('wmic cpu get NumberOfLogicalProcessors /value')
-                );
+            my $values = parse_key_value_output(
+                execute_windows_management_command(
+                    'wmic cpu get NumberOfLogicalProcessors /value',
+                    q{$total = (Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum; "NumberOfLogicalProcessors=$total"}
+                ) );
                 my $cntCPU =
                     extract_numeric_value( $values->{NumberOfLogicalProcessors} );
                 return $cntCPU + 0 if defined $cntCPU;
@@ -1586,7 +1593,7 @@ sub execute_system_command {
 
         # Be less verbose for commands that are expected to fail on some systems
         if ( $command !~
-/(?:^|\/)(dmesg|lspci|dmidecode|ipconfig|isainfo|bootinfo|ver|wmic|lsattr|prtconf|swapctl|swapinfo|svcprop|ps|ping|ifconfig|ip|hostname|who|free|top|uptime|netstat|sysctl|mysql|mariadb|curl|wget)/
+    /(?:^|\/)(dmesg|lspci|dmidecode|ipconfig|isainfo|bootinfo|ver|wmic|powershell|pwsh|lsattr|prtconf|swapctl|swapinfo|svcprop|ps|ping|ifconfig|ip|hostname|who|free|top|uptime|netstat|sysctl|mysql|mariadb|curl|wget)/
           )
         {
             badprint "System command failed: $command";
@@ -1623,6 +1630,7 @@ sub join_command_parts {
     return join ' ', grep { defined $_ && length $_ } @_;
 }
 
+sub build_mysqladmin_ping_command;
 sub mysql_password_option {
     my ($password) = @_;
     return '' unless defined $password && length $password;
@@ -1637,6 +1645,11 @@ sub build_mysql_alive_check_command {
     my ( $client_cmd, $login_args, @extra_args ) = @_;
     return join_command_parts( $client_cmd, $login_args, '-Nrs', '-e',
         mysql_alive_query(), @extra_args );
+}
+
+sub build_mysqladmin_ping_command {
+    my ( $client_cmd, $login_args, @extra_args ) = @_;
+    return join_command_parts( $client_cmd, $login_args, 'ping', @extra_args );
 }
 
 sub parse_key_value_output {
@@ -1703,12 +1716,16 @@ sub get_windows_memory_stats {
     );
 
     my $os_values = parse_key_value_output(
-        execute_system_command(
-            'wmic OS get TotalVisibleMemorySize,FreePhysicalMemory,TotalVirtualMemorySize /value'
+        execute_windows_management_command(
+            'wmic OS get TotalVisibleMemorySize,FreePhysicalMemory,TotalVirtualMemorySize /value',
+            q{$os = Get-CimInstance Win32_OperatingSystem; "TotalVisibleMemorySize=$($os.TotalVisibleMemorySize)"; "FreePhysicalMemory=$($os.FreePhysicalMemory)"; "TotalVirtualMemorySize=$($os.TotalVirtualMemorySize)"}
         )
     );
     my $cs_values = parse_key_value_output(
-        execute_system_command('wmic ComputerSystem get TotalPhysicalMemory /value')
+        execute_windows_management_command(
+            'wmic ComputerSystem get TotalPhysicalMemory /value',
+            q{$cs = Get-CimInstance Win32_ComputerSystem; "TotalPhysicalMemory=$($cs.TotalPhysicalMemory)"}
+        )
     );
 
     $stats{total_visible_memory_kb} =
@@ -1786,7 +1803,10 @@ sub parse_windows_nameservers_from_ipconfig {
 sub get_windows_last_boot_time {
     my $values =
       parse_key_value_output(
-        execute_system_command('wmic OS get LastBootUpTime /value') );
+        execute_windows_management_command(
+            'wmic OS get LastBootUpTime /value',
+            q{$os = Get-CimInstance Win32_OperatingSystem; "LastBootUpTime=$([Management.ManagementDateTimeConverter]::ToDmtfDateTime($os.LastBootUpTime))"}
+        ) );
     return format_wmic_datetime( $values->{LastBootUpTime} );
 }
 
@@ -1795,6 +1815,12 @@ sub get_windows_logged_users {
 
     if ( my $query_cmd = which( 'query', $ENV{'PATH'} ) ) {
         @users = execute_system_command("$query_cmd user");
+    }
+
+    if ( !@users ) {
+        @users = execute_windows_powershell_command(
+            q{$users = Get-CimInstance Win32_ComputerSystem | Select-Object -ExpandProperty UserName; if ($users) { $users }}
+        );
     }
 
     if ( !@users ) {
@@ -2049,7 +2075,8 @@ sub mysql_setup {
             # mysql-quickbackup is installed
             $mysqllogin = "-u $mysql_login -p$mysql_pass";
             my $loginstatus =
-              execute_system_command("mysqladmin $mysqllogin ping");
+                            execute_system_command(
+                                build_mysqladmin_ping_command( 'mysqladmin', $mysqllogin ) );
             if ( $loginstatus =~ /mysqld is alive/ ) {
                 goodprint "Logged in using credentials from mysql-quickbackup.";
                 return 1;
@@ -2067,7 +2094,8 @@ sub mysql_setup {
         $mysqllogin =
           "-u admin -p" . execute_system_command("cat /etc/psa/.psa.shadow");
         my $loginstatus =
-          execute_system_command("$mysqladmincmd ping $mysqllogin");
+                    execute_system_command(
+                        build_mysqladmin_ping_command( $mysqladmincmd, $mysqllogin ) );
         unless ( $loginstatus =~ /mysqld is alive/ ) {
 
             # Plesk 10+
@@ -2076,7 +2104,8 @@ sub mysql_setup {
               . execute_system_command(
                 "/usr/local/psa/bin/admin --show-password");
             $loginstatus =
-              execute_system_command("$mysqladmincmd ping $mysqllogin");
+                            execute_system_command(
+                                build_mysqladmin_ping_command( $mysqladmincmd, $mysqllogin ) );
             unless ( $loginstatus =~ /mysqld is alive/ ) {
                 badprint
 "Attempted to use login credentials from Plesk and Plesk 10+, but they failed.";
@@ -2101,7 +2130,8 @@ sub mysql_setup {
 
         $mysqllogin = "-u $mysqluser -p$mysqlpass";
 
-        my $loginstatus = execute_system_command("mysqladmin ping $mysqllogin");
+        my $loginstatus = execute_system_command(
+            build_mysqladmin_ping_command( 'mysqladmin', $mysqllogin ) );
         unless ( $loginstatus =~ /mysqld is alive/ ) {
             badprint
 "Attempted to use login credentials from DirectAdmin, but they failed.";
@@ -2116,7 +2146,8 @@ sub mysql_setup {
         # We have a Debian maintenance account, use it
         $mysqllogin = "--defaults-file=/etc/mysql/debian.cnf";
         my $loginstatus =
-          execute_system_command("$mysqladmincmd $mysqllogin ping");
+                    execute_system_command(
+                        build_mysqladmin_ping_command( $mysqladmincmd, $mysqllogin ) );
         if ( $loginstatus =~ /mysqld is alive/ ) {
             goodprint
               "Logged in using credentials from Debian maintenance account.";
@@ -2133,7 +2164,8 @@ sub mysql_setup {
         # defaults-file or defaults-extra-file
         $mysqllogin = "$defaults_options $remotestring";
         my $loginstatus =
-          execute_system_command("$mysqladmincmd $mysqllogin ping");
+                    execute_system_command(
+                        build_mysqladmin_ping_command( $mysqladmincmd, $mysqllogin ) );
         if ( $loginstatus =~ /mysqld is alive/ ) {
             goodprint "Logged in using credentials from defaults file account.";
             return 1;
@@ -2222,7 +2254,8 @@ sub mysql_setup {
             }
             $mysqllogin .= $remotestring;
             my $loginstatus =
-              execute_system_command("$mysqladmincmd ping $mysqllogin");
+                            execute_system_command(
+                                build_mysqladmin_ping_command( $mysqladmincmd, $mysqllogin ) );
             if ( $loginstatus =~ /mysqld is alive/ ) {
 
                 #print STDERR "";
@@ -2863,6 +2896,36 @@ sub detect_database_container_name {
     return select_preferred_container_name(@all);
 }
 
+sub get_windows_shell_path {
+    return '' unless $is_win;
+    return which( 'powershell', $ENV{'PATH'} )
+      || which( 'pwsh', $ENV{'PATH'} )
+      || '';
+}
+
+sub execute_windows_powershell_command {
+    my ($powershell_script) = @_;
+    my $powershell = get_windows_shell_path();
+    return wantarray ? () : '' unless $powershell ne '';
+
+    my $command = join_command_parts(
+        quote_command_path($powershell), '-NoProfile', '-NonInteractive',
+        '-Command', shell_quote_arg($powershell_script)
+    );
+
+    return execute_system_command($command);
+}
+
+sub execute_windows_management_command {
+    my ( $wmic_command, $powershell_script ) = @_;
+
+    if ( my $wmic_path = which( 'wmic', $ENV{'PATH'} ) ) {
+        return execute_system_command($wmic_command);
+    }
+
+    return execute_windows_powershell_command($powershell_script);
+}
+
 sub log_file_recommendations {
     my $has_pfs_error_log = 0;
     if ( $opt{'dbstat'} ) {
@@ -3141,7 +3204,6 @@ sub get_process_memory {
     return 0 if $is_win;    #Windows cmd cannot provide this
     my $pid = shift;
 
-    # Linux /proc fallback
     if ( $^O eq 'linux' && -f "/proc/$pid/statm" ) {
         if ( open( my $fh, '<', "/proc/$pid/statm" ) ) {
             my $line = <$fh>;
@@ -3279,7 +3341,10 @@ sub get_fs_info {
 
 sub get_fs_info_win {
         my @records = parse_wmic_record_list(
-                execute_system_command('wmic logicaldisk get Caption,FreeSpace,Size /value')
+        execute_windows_management_command(
+            'wmic logicaldisk get Caption,FreeSpace,Size /value',
+            q{Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" | ForEach-Object { "Caption=$($_.DeviceID)"; "FreeSpace=$($_.FreeSpace)"; "Size=$($_.Size)"; "" }}
+        )
         );
 
         foreach my $record (@records) {
@@ -3345,8 +3410,13 @@ sub is_virtual_machine {
     }
 
     if ($is_win) {
-        my $isVM = execute_system_command('systeminfo');
-        return ( $isVM =~ /System Model:\s*(Virtual Machine|VMware)/i ? 1 : 0 );
+        my $isVM = execute_windows_powershell_command(
+            q{$model = Get-CimInstance Win32_ComputerSystem | Select-Object -ExpandProperty Model; if ($model -match 'Virtual Machine|VMware|VirtualBox|KVM|Hyper-V') { 'virtual' } else { $model }}
+        );
+        if ( $isVM eq '' ) {
+            $isVM = execute_system_command('systeminfo');
+        }
+        return ( $isVM =~ /Virtual Machine|VMware|VirtualBox|KVM|Hyper-V|virtual/i ? 1 : 0 );
     }
     return 0;
 }
@@ -3487,7 +3557,7 @@ sub get_system_info {
         infoprint "Machine type          : Container";
         $result{'OS'}{'Virtual Machine'} = 'YES';
     }
-    elsif (is_virtual_machine) {
+    elsif ( is_virtual_machine() ) {
         infoprint "Machine type          : Virtual machine";
         $result{'OS'}{'Virtual Machine'} = 'YES';
     }
@@ -3570,7 +3640,7 @@ sub get_system_info {
         }
         else {
             $name_servers =
-              infocmd_one "grep 'nameserver' /etc/resolv.conf \| awk '{print \$2}'";
+              infocmd_one("grep 'nameserver' /etc/resolv.conf \| awk '{print \$2}'");
         }
         $logged_users       = execute_system_command('who');
         $free_memory_report = execute_system_command('free -m | grep -v +');
@@ -4330,7 +4400,10 @@ sub check_architecture {
     elsif ($is_win) {
         my $values =
           parse_key_value_output(
-            execute_system_command('wmic os get osarchitecture /value') );
+                        execute_windows_management_command(
+                                'wmic os get osarchitecture /value',
+                                q{$os = Get-CimInstance Win32_OperatingSystem; "OSArchitecture=$($os.OSArchitecture)"}
+                        ) );
         my $os_arch =
              $values->{OSArchitecture}
           || $ENV{PROCESSOR_ARCHITECTURE}
